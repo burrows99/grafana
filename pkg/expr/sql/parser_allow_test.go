@@ -270,6 +270,89 @@ func TestAllowQuery(t *testing.T) {
 			q:    `SELECT @myvar FROM a`,
 			err:  &ErrorWithCategory{},
 		},
+
+		// === backtick-quoted columns whose name starts with '@' ===
+		// https://github.com/grafana/grafana/issues/131244 -- `@timestamp` is
+		// the conventional Elasticsearch time field. sqlparser.ColName does
+		// not retain quoting, so `@timestamp` and the bare user variable
+		// @timestamp parse identically; only the raw SQL text can tell them
+		// apart (see backtickQuotedNames in parser_allow.go).
+
+		{
+			name: "allowed: backtick-quoted `@timestamp` column",
+			q:    "SELECT `@timestamp` FROM A",
+			err:  nil,
+		},
+		{
+			name: "allowed: backtick-quoted `@timestamp` column, aliased and filtered",
+			q:    "SELECT `@timestamp` AS ts FROM A WHERE `@timestamp` IS NOT NULL ORDER BY `@timestamp`",
+			err:  nil,
+		},
+		{
+			name: "blocked: @@hostname stays blocked even when backtick-quoted",
+			q:    "SELECT `@@hostname` FROM a",
+			err:  &ErrorWithCategory{},
+		},
+		{
+			name: "blocked: bare @timestamp user variable is still blocked when unquoted",
+			q:    `SELECT @timestamp FROM A`,
+			err:  &ErrorWithCategory{},
+		},
+		{
+			name: "allowed: `a@b` (an internal, non-leading @) is unaffected by this check",
+			q:    "SELECT `a@b` FROM A",
+			err:  nil,
+		},
+		{
+			name: "allowed: backtick-quoted name with an escaped literal backtick, `@a``b`",
+			q:    "SELECT `@a``b` FROM A",
+			err:  nil,
+		},
+		{
+			name: "allowed: backtick-quoted `@timestamp` after a string with an escaped quote",
+			q:    "SELECT 'it''s here', `@timestamp` FROM A",
+			err:  nil,
+		},
+		{
+			name: "blocked: @myvar is not exempted by a backtick pair inside a single-quoted string",
+			q:    "SELECT @myvar, 'contains `@myvar` as text' FROM A",
+			err:  &ErrorWithCategory{},
+		},
+		{
+			name: "blocked: @myvar is not exempted by a backtick pair inside a double-quoted string",
+			q:    `SELECT @myvar, "contains ` + "`@myvar`" + ` as text" FROM A`,
+			err:  &ErrorWithCategory{},
+		},
+		{
+			name: "blocked: @myvar is not exempted by a backtick pair inside a -- comment",
+			q:    "SELECT @myvar FROM A -- `@myvar`",
+			err:  &ErrorWithCategory{},
+		},
+		{
+			name: "blocked: @myvar is not exempted by a backtick pair inside a mid-query -- comment",
+			q:    "SELECT @myvar -- `@myvar`\nFROM A",
+			err:  &ErrorWithCategory{},
+		},
+		{
+			name: "blocked: @myvar is not exempted by a backtick pair inside a # comment",
+			q:    "SELECT @myvar FROM A # `@myvar`",
+			err:  &ErrorWithCategory{},
+		},
+		{
+			name: "blocked: @myvar is not exempted by a backtick pair inside a block comment",
+			q:    "SELECT @myvar /* `@myvar` */ FROM A",
+			err:  &ErrorWithCategory{},
+		},
+		{
+			name: "blocked: @myvar is not exempted by a backtick pair inside a // comment",
+			q:    "SELECT @myvar FROM A // `@myvar`",
+			err:  &ErrorWithCategory{},
+		},
+		{
+			name: "blocked: @myvar is not exempted by a backtick pair inside a backslash-escaped string",
+			q:    `SELECT @myvar, 'a\'` + "`@myvar`" + `b' FROM A`,
+			err:  &ErrorWithCategory{},
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
