@@ -1,0 +1,55 @@
+{
+  "schema": "swe-verify/plan@1",
+  "id": "alerting-resolved-on-delete",
+  "intent": "deleting a firing alert rule sends its resolved notification using the cleanup context, not the cancelled one",
+  "domain": "fullstack",
+  "scope": {
+    "include": [
+      "pkg/services/ngalert/schedule/**"
+    ]
+  },
+  "fixture": {
+    "kind": "process",
+    "language": "go",
+    "program": ".",
+    "file": "pkg/services/ngalert/schedule/x",
+    "mode": "test",
+    "args": [
+      "-test.run",
+      "TestRuleRoutine",
+      "-test.v"
+    ],
+    "awaitExit": true
+  },
+  "steps": [],
+  "assertions": [
+    {
+      "id": "resolved-notification-sent-with-live-context",
+      "kind": "terminal-match",
+      "afterStep": 0,
+      "expect": {
+        "contains": "--- PASS: TestRuleRoutine/should_exit/and_send_resolved_notifications_if_errRuleDeleted_is_the_reason_for_stopping",
+        "absent": "context canceled"
+      }
+    },
+    {
+      "id": "no-other-failures-in-suite",
+      "kind": "terminal-match",
+      "afterStep": 0,
+      "expect": {
+        "absent": "FAIL"
+      }
+    }
+  ],
+  "record": {
+    "terminal": {
+      "steps": [
+        {
+          "caption": "TestRuleRoutine/should_exit/and_send_resolved_notifications_if_errRuleDeleted_is_the_reason_for_stopping",
+          "command": "go test ./pkg/services/ngalert/schedule/... -run 'TestRuleRoutine/should_exit/and_send_resolved_notifications_if_errRuleDeleted_is_the_reason_for_stopping' -v -count=1",
+          "waitMs": 60000
+        }
+      ]
+    }
+  }
+}
