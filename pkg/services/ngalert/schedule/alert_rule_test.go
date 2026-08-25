@@ -820,7 +820,23 @@ func TestRuleRoutine(t *testing.T) {
 		t.Run("and send resolved notifications if errRuleDeleted is the reason for stopping", func(t *testing.T) {
 			stoppedChan := make(chan error)
 			sender := NewSyncAlertsSenderMock()
-			sender.EXPECT().Send(mock.Anything, mock.Anything, mock.Anything).Times(1)
+
+			// Sample the context's state *at send time*. Holding on to the
+			// context and inspecting it afterwards would always report it
+			// cancelled, because the cleanup context is cancelled by a defer
+			// as soon as the routine returns.
+			//
+			// The assertion below is the point of this test: a cancelled
+			// context reaches the Alertmanager client and the send fails
+			// immediately, so the alert stays firing forever. Matching on
+			// mock.Anything cannot tell that apart from a working send.
+			var sentErr error
+			var sentHasDeadline bool
+			sender.EXPECT().Send(mock.Anything, mock.Anything, mock.Anything).
+				Run(func(ctx context.Context, _ models.AlertRuleKey, _ definitions.PostableAlerts) {
+					sentErr = ctx.Err()
+					_, sentHasDeadline = ctx.Deadline()
+				}).Times(1)
 			sch, _, _, _ := createSchedule(make(chan time.Time), sender, clock.NewMock())
 
 			_, _ = sch.stateManager.ProcessEvalResults(context.Background(), sch.clock.Now(), rule, genEvalResults(sch.clock.Now()), nil, nil)
@@ -839,6 +855,11 @@ func TestRuleRoutine(t *testing.T) {
 
 			require.Empty(t, sch.stateManager.GetStatesForRuleUID(context.Background(), rule.OrgID, rule.UID))
 			sender.AssertExpectations(t)
+
+			require.NoError(t, sentErr,
+				"resolved notifications must be sent with a live context; a cancelled one fails the send and leaves the alert firing")
+			require.True(t, sentHasDeadline,
+				"resolved notifications should use the bounded cleanup context, so a stuck send cannot run forever")
 		})
 	})
 
