@@ -16,6 +16,14 @@ func AllowQuery(refID, rawSQL string) (bool, error) {
 		return false, fmt.Errorf("error parsing sql: %s", err.Error())
 	}
 
+	// A backtick-quoted column (e.g. `@timestamp`, the conventional
+	// Elasticsearch time field) and the unquoted MySQL user variable
+	// @timestamp parse to the exact same *sqlparser.ColName -- the AST drops
+	// quoting information entirely. The only place that distinction survives
+	// is the raw SQL text, so it's collected once here and consulted in
+	// allowedNode below.
+	quotedNames := backtickQuotedNames(rawSQL)
+
 	// walkNodes validates all nodes in the AST against the allowlist.
 	// It supplements sqlparser.Walk to cover fields that upstream walkSubtree
 	// implementations skip. SetOp skips OrderBy/With/Limit, and Select skips
@@ -24,7 +32,7 @@ func AllowQuery(refID, rawSQL string) (bool, error) {
 	var walkNodes func(nodes ...sqlparser.SQLNode) error
 	walkNodes = func(nodes ...sqlparser.SQLNode) error {
 		return sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
-			if !allowedNode(node) {
+			if !allowedNode(node, quotedNames) {
 				if fT, ok := node.(*sqlparser.FuncExpr); ok {
 					return false, MakeBlockedNodeOrFuncError(refID, fT.Name.String(), true)
 				}
@@ -65,7 +73,7 @@ func AllowQuery(refID, rawSQL string) (bool, error) {
 }
 
 // nolint:gocyclo,nakedret
-func allowedNode(node sqlparser.SQLNode) (b bool) {
+func allowedNode(node sqlparser.SQLNode, quotedNames map[string]bool) (b bool) {
 	b = true // so don't have to return true in every case but default
 
 	switch v := node.(type) {
@@ -95,10 +103,19 @@ func allowedNode(node sqlparser.SQLNode) (b bool) {
 
 	case *sqlparser.ColName:
 		// Reject @@system variables (e.g. @@hostname, @@version, @@secure_file_priv).
-		// These are parsed as ColName with the @@ prefix in Name.val.
-		// Also reject @@global.hostname where @@ is in the Qualifier.
+		// These are parsed as ColName with the @@ prefix in Name.val. Quoting
+		// with backticks does not exempt them: a real column named `@@x` is
+		// not a realistic case, and keeping this unconditional preserves the
+		// system-variable boundary regardless of how the query is written.
 		name := v.Name.String()
-		if strings.HasPrefix(name, "@@") || strings.HasPrefix(name, "@") {
+		if strings.HasPrefix(name, "@@") {
+			return false
+		}
+		// A single leading @ is otherwise a MySQL user variable (e.g. @myvar)
+		// and stays blocked -- unless the raw SQL backtick-quoted this exact
+		// name somewhere, which is how a genuine column such as `@timestamp`
+		// parses. See backtickQuotedNames and the comment in AllowQuery.
+		if strings.HasPrefix(name, "@") && !quotedNames[name] {
 			return false
 		}
 		if qual := v.Qualifier.Name.String(); strings.HasPrefix(qual, "@@") {
@@ -217,6 +234,107 @@ func allowedNode(node sqlparser.SQLNode) (b bool) {
 	default:
 		return false
 	}
+}
+
+// backtickQuotedNames scans rawSQL for backtick-quoted identifiers (e.g.
+// `@timestamp`) and returns the set of their unescaped names. It exists
+// because sqlparser's AST does not retain quoting: a backtick-quoted column
+// and a bare identifier of the same name produce an identical ColName node
+// (see AllowQuery), so this is the only remaining seam to tell them apart.
+//
+// String literals and comments are skipped so a backtick appearing only
+// inside one of those cannot be mistaken for a quoted identifier -- doing
+// otherwise would let a crafted string or comment forge an entry in the
+// returned set and reopen the user-variable case this guards against. Going
+// too far the other way (treating real code as a comment/string and thereby
+// missing a genuine quoted identifier) only leaves a column blocked, which
+// is the safe direction.
+func backtickQuotedNames(rawSQL string) map[string]bool {
+	names := map[string]bool{}
+	n := len(rawSQL)
+	for i := 0; i < n; {
+		switch c := rawSQL[i]; {
+		case c == '\'' || c == '"':
+			i = skipStringLiteral(rawSQL, i)
+		case c == '#':
+			i = skipToLineEnd(rawSQL, i)
+		case c == '-' && i+1 < n && rawSQL[i+1] == '-':
+			i = skipToLineEnd(rawSQL, i)
+		case c == '/' && i+1 < n && rawSQL[i+1] == '/':
+			i = skipToLineEnd(rawSQL, i)
+		case c == '/' && i+1 < n && rawSQL[i+1] == '*':
+			i = skipBlockComment(rawSQL, i)
+		case c == '`':
+			var name string
+			name, i = scanBacktickIdent(rawSQL, i)
+			names[name] = true
+		default:
+			i++
+		}
+	}
+	return names
+}
+
+// skipStringLiteral returns the index just past the single- or double-quoted
+// string literal starting at s[i], honouring backslash escapes and a
+// doubled delimiter as an escaped literal quote.
+func skipStringLiteral(s string, i int) int {
+	delim := s[i]
+	n := len(s)
+	for i++; i < n; i++ {
+		switch s[i] {
+		case '\\':
+			i++ // skip the escaped character; loop's i++ advances past it
+		case delim:
+			if i+1 < n && s[i+1] == delim {
+				i++
+				continue
+			}
+			return i + 1
+		}
+	}
+	return n
+}
+
+// skipToLineEnd returns the index of the next newline at or after s[i], or
+// len(s) if there is none -- used for --, #, and // line comments.
+func skipToLineEnd(s string, i int) int {
+	if idx := strings.IndexByte(s[i:], '\n'); idx >= 0 {
+		return i + idx
+	}
+	return len(s)
+}
+
+// skipBlockComment returns the index just past the /* ... */ block comment
+// starting at s[i:i+2].
+func skipBlockComment(s string, i int) int {
+	if idx := strings.Index(s[i+2:], "*/"); idx >= 0 {
+		return i + 2 + idx + 2
+	}
+	return len(s)
+}
+
+// scanBacktickIdent reads the backtick-quoted identifier starting at s[i]
+// (a backtick), unescaping a doubled backtick to a literal one, and returns
+// its unescaped content along with the index just past the closing
+// backtick.
+func scanBacktickIdent(s string, i int) (string, int) {
+	n := len(s)
+	var b strings.Builder
+	for i++; i < n; i++ {
+		if s[i] == '`' {
+			if i+1 < n && s[i+1] == '`' {
+				b.WriteByte('`')
+				i++
+				continue
+			}
+			return b.String(), i + 1
+		}
+		b.WriteByte(s[i])
+	}
+	// Unterminated identifier -- sqlparser.Parse will already have rejected
+	// a query like this before backtickQuotedNames is ever called.
+	return b.String(), i
 }
 
 // nolint:gocyclo,nakedret

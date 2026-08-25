@@ -1,0 +1,14 @@
+{
+  "schema": "swe-verify/config@1",
+  "domain": "fullstack",
+  "vcs": "auto",
+  "runner": "local",
+  "artifactStore": "fs",
+  "telemetry": "off",
+  "scope": {
+    "include": ["pkg/**"],
+    "exclude": ["**/*_test.go", "**/*.md"],
+    "languages": ["go"]
+  },
+  "coverage": { "policy": "all-executable", "defensive": "warn", "waiverCapPct": 10 }
+}
